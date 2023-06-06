@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
+use local_sync::{mpsc, oneshot};
+
 #[cfg(feature = "time")]
 const DEFAULT_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_KEEPALIVE_CONNS: usize = 256;
@@ -17,18 +20,21 @@ const DEFAULT_POOL_SIZE: usize = 32;
 // https://datatracker.ietf.org/doc/html/rfc6335
 const MAX_KEEPALIVE_CONNS: usize = 16384;
 
-use monoio_http::h1::codec::ClientCodec;
-
-type Conns<K, IO> = Rc<UnsafeCell<SharedInner<K, IO>>>;
-type WeakConns<K, IO> = Weak<UnsafeCell<SharedInner<K, IO>>>;
-
-struct IdleCodec<IO> {
-    codec: ClientCodec<IO>,
+use monoio_http::{ParamMut, h1::codec::ClientCodec, common::request::Request, common::response::Response, h1::payload::Payload};
+use monoio_http::common::{ext::Reason, request::RequestHead, response::ResponseHead, IntoParts}
+use rustls::internal::msgs::codec::Codec;
+use monoio::io::{sink::SinkExt, stream::Stream, AsyncReadRent, AsyncWriteRent, Split};
+use http::HeaderMap;
+type Conns<K, B> = Rc<UnsafeCell<SharedInner<K, B>>>;
+type WeakConns<K, B> = Weak<UnsafeCell<SharedInner<K, B>>>;
+use monoio_http::h1::codec::decoder::FillPayload;
+struct IdleConnection<B> {
+    pipe: PooledConnectionPipe<B>,
     idle_at: Instant,
 }
 
-struct SharedInner<K, IO> {
-    mapping: HashMap<K, VecDeque<IdleCodec<IO>>>,
+struct SharedInner<K, B> {
+    mapping: HashMap<K, VecDeque<IdleConnection<B>>>,
     max_idle: usize,
     #[cfg(feature = "time")]
     _drop: local_sync::oneshot::Receiver<()>,
@@ -75,11 +81,11 @@ impl<K, IO> SharedInner<K, IO> {
 
 // TODO: Connection leak? Maybe remove expired connection periodically.
 #[derive(Debug)]
-pub struct ConnectionPool<K: Hash + Eq, IO> {
-    conns: Conns<K, IO>,
+pub struct ConnectionPool<K: Hash + Eq, B> {
+    conns: Conns<K, B>,
 }
 
-impl<K: Hash + Eq, IO> Clone for ConnectionPool<K, IO> {
+impl<K: Hash + Eq, B> Clone for ConnectionPool<K, B> {
     fn clone(&self) -> Self {
         Self {
             conns: self.conns.clone(),
@@ -87,20 +93,279 @@ impl<K: Hash + Eq, IO> Clone for ConnectionPool<K, IO> {
     }
 }
 
-pub struct PooledConnection<K, IO>
+// Should point to the dispatcher
+// 
+// - Figure out the request flow
+// - Figure out how to handle the clean up cases
+// - Map out the data strucutres and the relationship
+// - Start coding
+
+// - Will have the reciever side of channel
+// - Will have a weak ref to the pool 
+//pub struct Http1ClientTask;
+// rx_chan - Recv (request, onehot_result_sender) from the ReqManager
+// pool_ptr - If there is an error, go ahead and remove the reqManager from the pool
+// conn_info - Key, and any metadata 
+
+// use 
+// phhub struct Http2ClientTask;
+
+// pub struct Http1ReqManager;
+// tx_chan - Send (request, oneshot_result_sender) to the Task from here  (Clonable for http/2)
+// pool_ptr Weak pointer to the Pool
+// oneshot_result_recv to get the result back from the clientTask 
+
+pub struct MyError;
+
+pub struct Transaction<B> 
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+{
+    req: Request<B>,
+    resp_tx: oneshot::Sender<Result<Response<B>, MyError>>
+}
+
+impl<B> Transaction<B> 
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+{
+    fn parts(self) -> (Request<B>, oneshot::Sender<Result<Response<B>, MyError>>) {
+        (self.req, self.resp_tx)
+    } 
+
+}
+struct SingleRecvr<B> 
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+{
+    req_rx: mpsc::unbounded::Rx<Transaction<B>>
+}
+
+struct SingleSender<B>
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+{
+    req_tx: mpsc::unbounded::Tx<Transaction<B>>
+}
+
+impl<B> SingleSender<B> 
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+
+{
+    pub fn into_multi_sender(self) -> MultiSender<B>{
+        MultiSender { req_tx: self.req_tx }
+    } 
+}
+
+struct MultiSender<B> 
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+{
+    req_tx: mpsc::unbounded::Tx<Transaction<B>>
+}
+
+impl<B> Clone for MultiSender<B> 
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            req_tx: self.req_tx.clone()
+        }
+    }
+}
+pub struct Http1ConnManager<IO, B>
+{
+    req_rx: SingleRecvr<B>,
+    handle: ClientCodec<IO>
+}
+
+const CONN_CLOSE: &[u8] = b"close";
+
+/* 
+[rustc] the method `send_and_flush` exists for struct `ClientCodec<IO>`, but its trait bounds were not satisfied
+the following trait bounds were not satisfied:
+`ClientCodec<IO>: monoio::io::sink::Sink<_>`
+which is required by `ClientCodec<IO>: SinkExt<_>`
+*/
+
+impl<IO, B> Http1ConnManager<IO, B> 
+where
+Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+IO: AsyncReadRent + AsyncWriteRent + Split
+{
+    async fn drive(&self) {
+        loop {
+
+            while let Some(t)= self.req_rx.req_rx.recv().await {
+                let (request, resp_tx) = t.parts();
+
+                match self.handle.send_and_flush(request).await {
+                    Ok(_) => match self.handle.next().await {
+                        Some(Ok(resp)) => {
+                            if let Err(e) = self.handle.fill_payload().await {
+                                #[cfg(feature = "logging")]
+                                tracing::error!("fill payload error {:?}", e);
+                                break;
+                                //return Err(Error::Decode(e));
+                            }
+                            // let resp: http::Response<B> = resp;
+                            let header_value = resp.headers().get(http::header::CONNECTION);
+
+                            let reuse_conn = match header_value {
+                                Some(v) => !v.as_bytes().eq_ignore_ascii_case(CONN_CLOSE),
+                                None => resp.version() != http::Version::HTTP_10,
+                            };
+                            // self.handl.set_reuseable(reuse_conn);
+                            resp_tx.send(Ok(resp));
+                        }
+                        Some(Err(e)) => {
+                            #[cfg(feature = "logging")]
+                            tracing::error!("decode upstream response error {:?}", e);
+                            // Err(Error::Decode(e))
+                        }
+                        None => {
+                            #[cfg(feature = "logging")]
+                            tracing::error!("upstream return eof");
+                            // self.handle.set_reuseable(false);
+                            // Err(Error::Io(std::io::Error::new(
+                            //     std::io::ErrorKind::UnexpectedEof,
+                            //     "unexpected eof when read response",
+                            // )))
+                        }
+                    },
+                    Err(e) => {
+                        #[cfg(feature = "logging")]
+                        tracing::error!("send upstream request error {:?}", e);
+                        // Err(Error::Encode(e))
+                    }
+                }
+            }
+            
+            // else {
+            //     Err// (Error::Io(std::io::Error::new(
+            //         std::io::ErrorKind::ConnectionRefused,
+            //         "connection established failed",
+            //     )))
+            // }
+
+        }
+    }
+}
+
+pub struct Http2ConnManager<B> {
+    req_rx: SingleRecvr<B>,
+    handle: monoio_http::h2::client::SendRequest<bytes::Bytes> 
+}
+
+impl<B> Http2ConnManager<B> {
+    async fn drive(&self)  {
+        loop {
+            while let Some(t)= self.req_rx.req_rx.recv().await {
+                let (request, resp_tx) = t.parts();
+
+
+                let handle = self.handle.clone();
+                let (request, body) = 
+
+                async move {
+                    handle.send_request(req, false) {
+                        Ok(ok) => ok,
+                        Err(err) => {
+                            debug!("client send request error: {}", err);
+                            cb.send(Err((crate::Error::new_h2(err), None)));
+                            continue;
+                        }
+                    };
+
+
+                }
+
+
+                let f = FutCtx {
+                    is_connect,
+                    eos,
+                    fut,
+                    body_tx,
+                    body,
+                    cb,
+                };
+
+                // Check poll_ready() again.
+                // If the call to send_request() resulted in the new stream being pending open
+                // we have to wait for the open to complete before accepting new requests.
+                match self.h2_tx.poll_ready(cx) {
+                    Poll::Pending => {
+                        // Save Context
+                        self.fut_ctx = Some(f);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Ok(())) => (),
+                    Poll::Ready(Err(err)) => {
+                        f.cb.send(Err((crate::Error::new_h2(err), None)));
+                        continue;
+                    }
+                }
+
+            }
+
+        }
+
+    }
+
+}
+
+pub enum ConnectionManager<IO, B>
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+// IO: AsyncReadRent + AsyncWriteRent + Split
+{
+    Http1(Http1ConnManager<IO, B>),
+    Http2(Http2ConnManager<B>),
+}
+
+pub enum PooledConnectionPipe<B>
+// where
+// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+{
+    Http1(SingleSender<B>),
+    Http2(MultiSender<B>)
+}
+
+impl<IO, B>  ConnectionManager<IO, B> 
+where
+Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+IO: AsyncReadRent + AsyncWriteRent + Split
+{
+
+    async fn drive(&self) {
+        match  self {
+            ConnectionManager::Http1(ref conn) => {
+                conn.drive().await;
+            }
+            _ => { return; }
+        }
+    }
+}
+
+pub fn request_channel<B>() -> (SingleSender<B>, SingleRecvr<B>){
+    let (req_tx, req_rx) = mpsc::unbounded::channel();
+    (SingleSender {req_tx}, SingleRecvr {req_rx})
+}
+
+pub struct PooledConnection<K, B>
 where
     K: Hash + Eq + Debug,
 {
     // option is for take when drop
     key: Option<K>,
-    // option is for take when drop
-    codec: Option<ClientCodec<IO>>,
-
-    pool: WeakConns<K, IO>,
+    pipe: Option<PooledConnectionPipe<B>>,
+    pool: WeakConns<K, B>,
     reuseable: bool,
 }
 
-impl<K: Hash + Eq + 'static, IO: 'static> ConnectionPool<K, IO> {
+impl<K: Hash + Eq + 'static, B> ConnectionPool<K, B> {
     #[cfg(feature = "time")]
     fn new(idle_interval: Option<Duration>, max_idle: Option<usize>) -> Self {
         let (tx, inner) = SharedInner::new(max_idle);
@@ -123,7 +388,7 @@ impl<K: Hash + Eq + 'static, IO: 'static> ConnectionPool<K, IO> {
     }
 }
 
-impl<K: Hash + Eq + 'static, IO: 'static> Default for ConnectionPool<K, IO> {
+impl<K: Hash + Eq + 'static, B> Default for ConnectionPool<K, B> {
     #[cfg(feature = "time")]
     fn default() -> Self {
         Self::new(None, None)
@@ -135,34 +400,34 @@ impl<K: Hash + Eq + 'static, IO: 'static> Default for ConnectionPool<K, IO> {
     }
 }
 
-impl<K, IO> PooledConnection<K, IO>
-where
-    K: Hash + Eq + Debug,
-{
-    pub fn set_reuseable(&mut self, reuseable: bool) {
-        self.reuseable = reuseable;
-    }
-}
+// impl<K, IO> PooledConnection<K, IO>
+// where
+//     K: Hash + Eq + Display,
+// {
+//     pub fn set_reuseable(&mut self, reuseable: bool) {
+//         self.reuseable = reuseable;
+//     }
+// }
 
-impl<K, IO> Deref for PooledConnection<K, IO>
-where
-    K: Hash + Eq + Debug,
-{
-    type Target = ClientCodec<IO>;
+// impl<K, IO> Deref for PooledConnection<K, IO>
+// where
+//     K: Hash + Eq + Display,
+// {
+//     type Target = ClientCodec<IO>;
 
-    fn deref(&self) -> &Self::Target {
-        self.codec.as_ref().expect("connection should be present")
-    }
-}
+//     fn deref(&self) -> &Self::Target {
+//         self.codec.as_ref().expect("connection should be present")
+//     }
+// }
 
-impl<K, IO> DerefMut for PooledConnection<K, IO>
-where
-    K: Hash + Eq + Debug,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.codec.as_mut().expect("connection should be present")
-    }
-}
+// impl<K, IO> DerefMut for PooledConnection<K, IO>
+// where
+//     K: Hash + Eq + Display,
+// {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         self.codec.as_mut().expect("connection should be present")
+//     }
+// }
 
 impl<K, IO> Drop for PooledConnection<K, IO>
 where
@@ -177,9 +442,9 @@ where
 
         if let Some(pool) = self.pool.upgrade() {
             let key = self.key.take().expect("unable to take key");
-            let codec = self.codec.take().expect("unable to take connection");
-            let idle = IdleCodec {
-                codec,
+            let pipe = self.pipe.take().expect("unable to take connection");
+            let idle = IdleConnection {
+                pipe,
                 idle_at: Instant::now(),
             };
 
@@ -212,11 +477,11 @@ where
     }
 }
 
-impl<K, IO> ConnectionPool<K, IO>
+impl<K, B> ConnectionPool<K, B>
 where
     K: Hash + Eq + ToOwned<Owned = K> + Debug,
 {
-    pub fn get(&self, key: &K) -> Option<PooledConnection<K, IO>> {
+    pub fn get(&self, key: &K) -> Option<PooledConnection<K, B>> {
         let conns = unsafe { &mut *self.conns.get() };
 
         match conns.mapping.get_mut(key) {
@@ -225,7 +490,7 @@ where
                 tracing::debug!("connection got from pool for key: {key:?}");
                 v.pop_front().map(|idle| PooledConnection {
                     key: Some(key.to_owned()),
-                    codec: Some(idle.codec),
+                    pipe: Some(idle.pipe),
                     pool: Rc::downgrade(&self.conns),
                     reuseable: true,
                 })
@@ -238,12 +503,12 @@ where
         }
     }
 
-    pub fn link(&self, key: K, io: ClientCodec<IO>) -> PooledConnection<K, IO> {
+    pub fn link(&self, key: K, pipe: PooledConnectionPipe<B>) -> PooledConnection<K, B> {
         #[cfg(feature = "logging")]
         tracing::debug!("linked new connection to the pool");
         PooledConnection {
             key: Some(key),
-            codec: Some(io),
+            pipe: Some(pipe),
             pool: Rc::downgrade(&self.conns),
             reuseable: true,
         }
