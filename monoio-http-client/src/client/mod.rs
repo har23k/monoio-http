@@ -18,9 +18,9 @@ const CONN_CLOSE: &[u8] = b"close";
 // TODO: ClientBuilder
 pub struct ClientInner<C, #[cfg(feature = "tls")] CS> {
     cfg: ClientConfig,
-    http_connector: C,
+    http: C,
     #[cfg(feature = "tls")]
-    https_connector: CS,
+    https: CS,
 }
 
 pub struct Client<
@@ -56,9 +56,49 @@ pub struct ClientConfig {
     default_headers: Rc<HeaderMap>,
 }
 
-impl Default for Client {
-    fn default() -> Self {
-        Self::new()
+#[derive(Default, Clone)]
+enum Proto {
+    #[default] Http1,
+    Http2,
+}
+
+#[derive(Default, Clone)]
+pub struct ConnectionConfig {
+    proto: Proto
+    // HTTP1 & TTPE2 Connection specific 
+    // config can go here
+}
+
+#[derive(Default, Clone)]
+pub struct ClientGlobalConfig {
+    max_idle_connections: usize,
+    retry_enabled: bool
+}
+
+pub struct Builder {
+    connection_config: ConnectionConfig,
+    global_config: ClientGlobalConfig
+}
+
+impl Builder {
+
+    fn http1_client(&mut self) -> &mut Self {
+        self.connection_config.proto = Proto::Http1;
+        self
+    }
+
+    fn http2_client(&mut self) -> &mut Self {
+        self.connection_config.proto = Proto::Http2;
+        self
+    }
+
+    fn max_idle_connections(&mut self, conns: usize) -> &mut Self {
+        self.global_config.max_idle_connections = conns;
+        self
+    }
+
+    fn build_http1(self) -> Client {
+        Client::new(self.global_config, self.connection_config)
     }
 }
 
@@ -75,12 +115,12 @@ macro_rules! http_method {
 }
 
 impl Client {
-    pub fn new() -> Self {
+    pub fn new(g_config: ClientGlobalConfig, c_config: ConnectionConfig) -> Self {
         let shared = Rc::new(ClientInner {
             cfg: ClientConfig::default(),
-            http_connector: Default::default(),
+            http: DefaultTcpConnector::new(g_config.clone(), c_config.clone()),
             #[cfg(feature = "tls")]
-            https_connector: Default::default(),
+            https: DefaultTlsConnector::new(g_config, c_config),
         });
         Self { shared }
     }
@@ -112,7 +152,7 @@ impl Client {
         request: http::Request<Payload>,
     ) -> Result<http::Response<Payload>, crate::Error> {
         let key = request.uri().try_into()?;
-        if let Ok(mut codec) = self.shared.http_connector.connect(key).await {
+        if let Ok(mut codec) = self.shared.http.connect(key).await {
             match codec.send_and_flush(request).await {
                 Ok(_) => match codec.next().await {
                     Some(Ok(resp)) => {
@@ -165,7 +205,7 @@ impl Client {
         request: http::Request<Payload>,
     ) -> Result<http::Response<Payload>, crate::Error> {
         let key = request.uri().try_into()?;
-        if let Ok(mut codec) = self.shared.https_connector.connect(key).await {
+        if let Ok(mut codec) = self.shared.https.connect(key).await {
             match codec.send_and_flush(request).await {
                 Ok(_) => match codec.next().await {
                     Some(Ok(resp)) => {

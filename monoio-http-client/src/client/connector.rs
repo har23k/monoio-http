@@ -7,17 +7,19 @@ use std::{
     sync::Arc,
 };
 
-use monoio::net::TcpStream;
-use monoio_http::{h1::codec::ClientCodec, Param};
+use monoio::{net::TcpStream, io::{AsyncReadRent, AsyncWriteRent, Split}};
+use monoio_http::{h1::{codec::ClientCodec, payload::Payload}, Param};
 use rustls::client::ServerCertVerifier;
 
-use super::pool::{ConnectionPool, PooledConnection};
+use super::pool::{ConnectionPool, PooledConnection, Http1ConnManager, *};
 
 pub type TlsStream = monoio_rustls::ClientTlsStream<TcpStream>;
 
-pub type DefaultTcpConnector<T> = PooledConnector<TcpConnector, T, TcpStream>;
+pub type DefaultTcpConnector<T> = PooledConnector<TcpConnector, T, TcpStream, Payload>;
 #[cfg(feature = "tls")]
-pub type DefaultTlsConnector<T> = PooledConnector<TlsConnector, T, TlsStream>;
+pub type DefaultTlsConnector<T> = PooledConnector<TlsConnector, T, TlsStream, Payload>;
+
+use crate::client::*;
 
 pub trait Connector<K> {
     type Connection;
@@ -41,6 +43,51 @@ where
 
     fn connect(&self, key: T) -> Self::ConnectionFuture<'_> {
         async move { TcpStream::connect(key).await }
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpConnector {
+    conn_config: ConnectionConfig
+}
+
+impl HttpConnector {
+
+    pub fn new(conn_config: ConnectionConfig) -> Self {
+        Self {
+            conn_config
+        }
+    }
+
+    pub async fn connect<IO, B>(&self, io: IO) -> Result<PooledConnectionPipe<B>, io::Error>
+    where 
+        IO: AsyncReadRent + AsyncWriteRent + 'static + Unpin,
+    {
+        let (sender, recvr) = request_channel::<B>();
+
+        match self.conn_config.proto {
+            Proto::Http1 => {
+                let handle = ClientCodec::new(io);
+                let _conn = Http1ConnManager {req_rx: recvr, handle };
+                // monoio::spawn( async move {
+                //     conn.await;
+                // })
+                Ok(PooledConnectionPipe::Http1(sender))
+            }
+            Proto::Http2 => {
+                let (handle, h2_conn)  = monoio_http::h2::client::handshake(io).await.expect("Handshake failed");
+                monoio::spawn(async move {
+                    if let Err(e) = h2_conn.await {
+                        println!("H2 CONN ERR={:?}", e);
+                    }
+                });
+                let _conn = Http2ConnManager {req_rx: recvr, handle };
+                // monoio::spawn( async move {
+                //     conn.await;
+                // })
+                Ok(PooledConnectionPipe::Http2(sender.into_multi_sender()))
+            }
+        }
     }
 }
 
@@ -116,57 +163,68 @@ where
         }
     }
 }
+use std::marker::PhantomData;
 
 /// PooledConnector does 2 things:
 /// 1. pool
 /// 2. combine connection with codec(of cause with buffer)
-pub struct PooledConnector<C, K: Hash + Eq, IO> {
-    inner: C,
-    pool: ConnectionPool<K, IO>,
+pub struct PooledConnector<TC, K: Hash + Eq, IO: AsyncReadRent + AsyncWriteRent + Split, B> {
+    global_config: ClientGlobalConfig,
+    transport_connector: TC,
+    http_connector: HttpConnector,
+    pool: ConnectionPool<K, B>,
+    _phantom: PhantomData<IO>
 }
 
-impl<C, K: Hash + Eq, IO> Clone for PooledConnector<C, K, IO>
+impl<C, K: Hash + Eq, IO: AsyncReadRent + AsyncWriteRent + Split, B> Clone for PooledConnector<C, K, IO, B>
 where
     C: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            global_config: self.global_config.clone(),
+            transport_connector: self.transport_connector.clone(),
+            http_connector: self.http_connector.clone(),
             pool: self.pool.clone(),
+            _phantom: PhantomData
         }
     }
 }
 
-impl<C, K: Hash + Eq + 'static, IO: 'static> Default for PooledConnector<C, K, IO>
-where
-    C: Default,
+impl<TC: Default, K: Hash + Eq, IO: AsyncReadRent + AsyncWriteRent + Split, B> PooledConnector<TC, K, IO, B>
 {
-    fn default() -> Self {
+    pub fn new(global_config: ClientGlobalConfig, c_config: ConnectionConfig) -> Self {
+
         Self {
-            inner: Default::default(),
+            global_config,
+            transport_connector: Default::default(),
+            http_connector: HttpConnector::new(c_config),
             pool: Default::default(),
+            _phantom: PhantomData
         }
     }
 }
 
-impl<C, T, IO> Connector<T> for PooledConnector<C, T, IO>
+impl<TC, K, IO, B> Connector<K> for PooledConnector<TC, K, IO, B>
 where
-    T: ToSocketAddrs + Hash + Eq + ToOwned<Owned = T> + Display,
-    C: Connector<T, Connection = IO>,
+    K: ToSocketAddrs + Hash + Eq + ToOwned<Owned = K> + Display,
+    TC: Connector<K, Connection = IO>,
+    IO: AsyncReadRent + AsyncWriteRent + Split + 'static + Unpin
 {
-    type Connection = PooledConnection<T, IO>;
-    type Error = C::Error;
+    type Connection = PooledConnection<K, B>;
+    type Error = TC::Error;
     type ConnectionFuture<'a> = impl Future<Output = Result<Self::Connection, Self::Error>> + 'a where Self: 'a;
 
-    fn connect(&self, key: T) -> Self::ConnectionFuture<'_> {
+    fn connect(&self, key: K) -> Self::ConnectionFuture<'_> {
         async move {
             if let Some(conn) = self.pool.get(&key) {
                 return Ok(conn);
             }
             let key_owned = key.to_owned();
-            let io = self.inner.connect(key).await?;
-            let codec = ClientCodec::new(io);
-            Ok(self.pool.link(key_owned, codec))
+            let io = self.transport_connector.connect(key).await?;
+
+            let pipe = self.http_connector.connect(io).await.expect("HTTP conn failed");
+            Ok(self.pool.link(key_owned, pipe))
         }
     }
 }
