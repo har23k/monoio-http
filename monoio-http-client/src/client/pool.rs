@@ -1,7 +1,7 @@
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, VecDeque},
-    fmt::Debug,
+    fmt::{Debug, Display},
     future::Future,
     hash::Hash,
     ops::{Deref, DerefMut},
@@ -12,22 +12,22 @@ use std::{
 
 use bytes::Bytes;
 use local_sync::{mpsc, oneshot};
+use monoio::macros::support::poll_fn;
 
 #[cfg(feature = "time")]
 const DEFAULT_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_KEEPALIVE_CONNS: usize = 256;
-const DEFAULT_POOL_SIZE: usize = 32;
 // https://datatracker.ietf.org/doc/html/rfc6335
 const MAX_KEEPALIVE_CONNS: usize = 16384;
-
-use monoio_http::{ParamMut, h1::codec::ClientCodec, common::request::Request, common::response::Response, h1::payload::Payload};
-use monoio_http::common::{ext::Reason, request::RequestHead, response::ResponseHead, IntoParts}
-use rustls::internal::msgs::codec::Codec;
+use monoio_http::{h1::codec::ClientCodec, common::{request::Request, body::{StreamHint, HttpBody}}, common::{response::Response, body::Body}, h1::payload::{Payload, PayloadError}, h2::SendStream};
+use monoio_http::common::{ext::Reason, request::RequestHead, response::ResponseHead, IntoParts};
 use monoio::io::{sink::SinkExt, stream::Stream, AsyncReadRent, AsyncWriteRent, Split};
 use http::HeaderMap;
 type Conns<K, B> = Rc<UnsafeCell<SharedInner<K, B>>>;
 type WeakConns<K, B> = Weak<UnsafeCell<SharedInner<K, B>>>;
 use monoio_http::h1::codec::decoder::FillPayload;
+
+use crate::error;
 struct IdleConnection<B> {
     pipe: PooledConnectionPipe<B>,
     idle_at: Instant,
@@ -35,36 +35,40 @@ struct IdleConnection<B> {
 
 struct SharedInner<K, B> {
     mapping: HashMap<K, VecDeque<IdleConnection<B>>>,
-    max_idle: usize,
+    keepalive_conns: usize,
     #[cfg(feature = "time")]
     _drop: local_sync::oneshot::Receiver<()>,
 }
 
 impl<K, IO> SharedInner<K, IO> {
     #[cfg(feature = "time")]
-    fn new(max_idle: Option<usize>) -> (local_sync::oneshot::Sender<()>, Self) {
-        let mapping = HashMap::with_capacity(DEFAULT_POOL_SIZE);
-        let max_idle = max_idle
-            .map(|n| n.min(MAX_KEEPALIVE_CONNS))
-            .unwrap_or(DEFAULT_KEEPALIVE_CONNS);
-
+    fn new(
+        keepalive_conns: usize,
+        upstream_count: usize,
+    ) -> (local_sync::oneshot::Sender<()>, Self) {
+        let mapping = HashMap::with_capacity(upstream_count);
+        let mut keepalive_conns = keepalive_conns % MAX_KEEPALIVE_CONNS;
+        if keepalive_conns < DEFAULT_KEEPALIVE_CONNS {
+            keepalive_conns = DEFAULT_KEEPALIVE_CONNS;
+        }
         let (tx, _drop) = local_sync::oneshot::channel();
         (
             tx,
             Self {
                 mapping,
                 _drop,
-                max_idle,
+                keepalive_conns,
             },
         )
     }
 
     #[cfg(not(feature = "time"))]
-    fn new(max_idle: Option<usize>) -> Self {
-        let mapping = HashMap::with_capacity(DEFAULT_POOL_SIZE);
-        let max_idle = max_idle
-            .map(|n| n.min(MAX_KEEPALIVE_CONNS))
-            .unwrap_or(DEFAULT_KEEPALIVE_CONNS);
+    fn new(keepalive_conns: usize, upstream_count: usize) -> Self {
+        let mapping = HashMap::with_capacity(upstream_count);
+        let mut keepalive_conns = keepalive_conns % MAX_KEEPALIVE_CONNS;
+        if keepalive_conns < DEFAULT_KEEPALIVE_CONNS {
+            keepalive_conns = DEFAULT_KEEPALIVE_CONNS;
+        }
         Self {
             mapping,
             keepalive_conns,
@@ -93,81 +97,41 @@ impl<K: Hash + Eq, B> Clone for ConnectionPool<K, B> {
     }
 }
 
-// Should point to the dispatcher
-// 
-// - Figure out the request flow
-// - Figure out how to handle the clean up cases
-// - Map out the data strucutres and the relationship
-// - Start coding
-
-// - Will have the reciever side of channel
-// - Will have a weak ref to the pool 
-//pub struct Http1ClientTask;
-// rx_chan - Recv (request, onehot_result_sender) from the ReqManager
-// pool_ptr - If there is an error, go ahead and remove the reqManager from the pool
-// conn_info - Key, and any metadata 
-
-// use 
-// phhub struct Http2ClientTask;
-
-// pub struct Http1ReqManager;
-// tx_chan - Send (request, oneshot_result_sender) to the Task from here  (Clonable for http/2)
-// pool_ptr Weak pointer to the Pool
-// oneshot_result_recv to get the result back from the clientTask 
-
-pub struct MyError;
-
-pub struct Transaction<B> 
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
-{
-    req: Request<B>,
-    resp_tx: oneshot::Sender<Result<Response<B>, MyError>>
+pub struct Transaction<B> {
+    pub req: Request<B>,
+    pub resp_tx: oneshot::Sender<crate::Result<Response<B>>>
 }
 
 impl<B> Transaction<B> 
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
 {
-    fn parts(self) -> (Request<B>, oneshot::Sender<Result<Response<B>, MyError>>) {
+    pub fn parts(self) -> (Request<B>, oneshot::Sender<crate::Result<Response<B>>>) {
         (self.req, self.resp_tx)
     } 
 
 }
-struct SingleRecvr<B> 
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+pub struct SingleRecvr<B> 
 {
-    req_rx: mpsc::unbounded::Rx<Transaction<B>>
+    pub req_rx: mpsc::unbounded::Rx<Transaction<B>>
 }
 
-struct SingleSender<B>
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+pub struct SingleSender<B>
 {
-    req_tx: mpsc::unbounded::Tx<Transaction<B>>
+    pub req_tx: mpsc::unbounded::Tx<Transaction<B>>
 }
 
 impl<B> SingleSender<B> 
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
-
 {
     pub fn into_multi_sender(self) -> MultiSender<B>{
         MultiSender { req_tx: self.req_tx }
     } 
 }
 
-struct MultiSender<B> 
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+pub struct MultiSender<B> 
 {
     req_tx: mpsc::unbounded::Tx<Transaction<B>>
 }
 
 impl<B> Clone for MultiSender<B> 
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
 {
     fn clone(&self) -> Self {
         Self {
@@ -177,171 +141,274 @@ impl<B> Clone for MultiSender<B>
 }
 pub struct Http1ConnManager<IO, B>
 {
-    req_rx: SingleRecvr<B>,
-    handle: ClientCodec<IO>
+    pub req_rx: SingleRecvr<B>,
+    pub handle: ClientCodec<IO>
 }
 
 const CONN_CLOSE: &[u8] = b"close";
 
-/* 
-[rustc] the method `send_and_flush` exists for struct `ClientCodec<IO>`, but its trait bounds were not satisfied
-the following trait bounds were not satisfied:
-`ClientCodec<IO>: monoio::io::sink::Sink<_>`
-which is required by `ClientCodec<IO>: SinkExt<_>`
-*/
-
 impl<IO, B> Http1ConnManager<IO, B> 
 where
-Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<Payload>,
 IO: AsyncReadRent + AsyncWriteRent + Split
 {
-    async fn drive(&self) {
-        loop {
+    pub async fn drive(&mut self) {
 
             while let Some(t)= self.req_rx.req_rx.recv().await {
                 let (request, resp_tx) = t.parts();
+                let(parts, body) = request.into_parts();
 
-                match self.handle.send_and_flush(request).await {
+                tracing::debug!("Response recv on h1 conn {:?}", parts);
+
+                match self.handle.send_and_flush(Request::from_parts(parts, body)).await {
                     Ok(_) => match self.handle.next().await {
                         Some(Ok(resp)) => {
                             if let Err(e) = self.handle.fill_payload().await {
                                 #[cfg(feature = "logging")]
                                 tracing::error!("fill payload error {:?}", e);
+                                let _ = resp_tx.send(Err(crate::Error::H1Decode(e)));
                                 break;
-                                //return Err(Error::Decode(e));
                             }
-                            // let resp: http::Response<B> = resp;
-                            let header_value = resp.headers().get(http::header::CONNECTION);
 
-                            let reuse_conn = match header_value {
-                                Some(v) => !v.as_bytes().eq_ignore_ascii_case(CONN_CLOSE),
-                                None => resp.version() != http::Version::HTTP_10,
-                            };
-                            // self.handl.set_reuseable(reuse_conn);
-                            resp_tx.send(Ok(resp));
+                            let (parts, body) = resp.into_parts();
+                            tracing::debug!("Sending reply back from conn manager {:?}", parts);
+                            let resp = Response::from_parts(parts, B::from(body));
+                            let _ = resp_tx.send(Ok(resp));
                         }
                         Some(Err(e)) => {
                             #[cfg(feature = "logging")]
                             tracing::error!("decode upstream response error {:?}", e);
-                            // Err(Error::Decode(e))
+                            let _ = resp_tx.send(Err(crate::Error::H1Decode(e)));
+                            break;
                         }
                         None => {
                             #[cfg(feature = "logging")]
                             tracing::error!("upstream return eof");
-                            // self.handle.set_reuseable(false);
-                            // Err(Error::Io(std::io::Error::new(
-                            //     std::io::ErrorKind::UnexpectedEof,
-                            //     "unexpected eof when read response",
-                            // )))
+                            let _ = resp_tx.send(Err(crate::Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected eof when read response",
+                            ))));
+                            break;                           // self.handle.set_reuseable(false);
                         }
                     },
                     Err(e) => {
                         #[cfg(feature = "logging")]
                         tracing::error!("send upstream request error {:?}", e);
-                        // Err(Error::Encode(e))
+                        let _ =resp_tx.send(Err(crate::Error::H1Encode(e)));
                     }
                 }
             }
-            
-            // else {
-            //     Err// (Error::Io(std::io::Error::new(
-            //         std::io::ErrorKind::ConnectionRefused,
-            //         "connection established failed",
-            //     )))
-            // }
-
-        }
     }
 }
 
-pub struct Http2ConnManager<B> {
-    req_rx: SingleRecvr<B>,
-    handle: monoio_http::h2::client::SendRequest<bytes::Bytes> 
+pub struct StreamTask<B: Body> {
+    stream_pipe: SendStream<Bytes>,
+    body: B,
+    data_done: bool
 }
 
-impl<B> Http2ConnManager<B> {
-    async fn drive(&self)  {
+impl<B: Body<Data = Bytes>> StreamTask<B> {
+    fn new(stream_pipe: SendStream<Bytes>, body: B) -> Self {
+        Self {
+            stream_pipe,
+            body,
+            data_done: false
+        }
+    }
+    async fn drive(&mut self) {
         loop {
+            if !self.data_done {
+                // we don't have the next chunk of data yet, so just reserve 1 byte to make
+                // sure there's some capacity available. h2 will handle the capacity management
+                // for the actual body chunk.
+                self.stream_pipe.reserve_capacity(1);
+
+                if self.stream_pipe.capacity() == 0 {
+                    loop {
+                        let cap = poll_fn(|cx| self.stream_pipe.poll_capacity(cx)).await;   
+                        match cap {
+                            Some(Ok(0)) => {}
+                            Some(Ok(_)) => break,
+                            Some(Err(_e)) => {
+                                return; 
+                                // return Poll::Ready(Err(crate::Error::new_body_write(e)))
+                            }
+                            None => {
+                                // None means the stream is no longer in a
+                                // streaming state, we either finished it
+                                // somehow, or the remote reset us.
+                                // return Poll::Ready(Err(crate::Error::new_body_write(
+                                //     "send stream capacity unexpectedly closed",
+                                // )));
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    let stream_rst = poll_fn(|cx| {
+                        match self.stream_pipe.poll_reset(cx) {
+                            std::task::Poll::Pending => std::task::Poll::Ready(false),
+                            std::task::Poll::Ready(_) => std::task::Poll::Ready(true),
+                        }
+                    }).await;
+
+                    if stream_rst {
+                        // debug!("stream received RST_STREAM: {:?}", reason);
+                        // return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(
+                        //     reason,
+                        // ))));
+                        return;
+                    }
+
+                }
+                
+                match  self.body.stream_hint() {
+                    StreamHint::None => {
+                        let _ = self.stream_pipe.send_data(Bytes::new(), true);
+                        self.data_done = true;
+                        tracing::debug!("H2 Stream task is done ");
+                    }
+                    StreamHint::Fixed => {
+                        if let Ok(Some(data)) = self.body.get_data().await {
+                         let _ = self.stream_pipe.send_data(data, true);
+                            self.data_done = true;
+                        }
+                   }
+                    StreamHint::Stream => {
+                        if let Ok(Some(data)) = self.body.get_data().await {
+                            let _ = self.stream_pipe.send_data(data, false);
+                        } else {
+                            let _ = self.stream_pipe.send_data(Bytes::new(), true);
+                            self.data_done = true;
+                        }
+                    }
+                }
+            } else {
+
+                let stream_rst = poll_fn(|cx| {
+                    match self.stream_pipe.poll_reset(cx) {
+                        std::task::Poll::Pending => std::task::Poll::Ready(false),
+                        std::task::Poll::Ready(_) => std::task::Poll::Ready(true),
+                    }
+                }).await;
+
+                if stream_rst {
+                    // debug!("stream received RST_STREAM: {:?}", reason);
+                    // return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(
+                    //     reason,
+                    // ))));
+                    return;
+                }
+                break;
+                // TODO: Handle trailer
+            }
+        }
+    } 
+
+}
+
+pub struct Http2ConnManager<B: Body<Data = Bytes>> {
+    pub req_rx: SingleRecvr<B>,
+    pub handle: monoio_http::h2::client::SendRequest<bytes::Bytes> 
+}
+
+impl<B> Http2ConnManager<B> 
+where
+B: Body<Data = Bytes> + From<monoio_http::h2::RecvStream> + From<Payload> + 'static,
+{
+    pub async fn drive(&mut self)  {
             while let Some(t)= self.req_rx.req_rx.recv().await {
                 let (request, resp_tx) = t.parts();
-
+                let (parts, body) = request.into_parts();
+                tracing::debug!("H2 conn manager recv request error {:?}", parts);
+                let request = http::request::Request::from_parts(parts, ());
 
                 let handle = self.handle.clone();
-                let (request, body) = 
+                let mut ready_handle = handle.ready().await.unwrap();
 
-                async move {
-                    handle.send_request(req, false) {
-                        Ok(ok) => ok,
-                        Err(err) => {
-                            debug!("client send request error: {}", err);
-                            cb.send(Err((crate::Error::new_h2(err), None)));
-                            continue;
-                        }
-                    };
-
-
-                }
-
-
-                let f = FutCtx {
-                    is_connect,
-                    eos,
-                    fut,
-                    body_tx,
-                    body,
-                    cb,
+                let (resp_fut, send_stream) = match ready_handle.send_request(request, false) {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                         tracing::debug!("client send request error: {}", e);
+                         let _ = resp_tx.send(Err(e.into()));
+                         break;
+                    }
                 };
+                
+                tracing::debug!("H2 conn manager sent request to server");
 
-                // Check poll_ready() again.
-                // If the call to send_request() resulted in the new stream being pending open
-                // we have to wait for the open to complete before accepting new requests.
-                match self.h2_tx.poll_ready(cx) {
-                    Poll::Pending => {
-                        // Save Context
-                        self.fut_ctx = Some(f);
-                        return Poll::Pending;
+                monoio::spawn(async move {
+                    let mut stream_task = StreamTask::new(send_stream, body);
+                    stream_task.drive().await;
+                });
+
+                monoio::spawn(async move {
+                    match resp_fut.await {
+                        Ok(resp) => {
+                           let (parts, body) = resp.into_parts();
+                           tracing::debug!("Response from server {:?}", parts);
+                           let ret_resp = Response::from_parts(parts, B::from(body));
+                           let _ = resp_tx.send(Ok(ret_resp));
+                       },
+                       Err(e) => {
+                         let _ = resp_tx.send(Err(e.into()));
+                       }
                     }
-                    Poll::Ready(Ok(())) => (),
-                    Poll::Ready(Err(err)) => {
-                        f.cb.send(Err((crate::Error::new_h2(err), None)));
-                        continue;
-                    }
-                }
-
-            }
-
+                });
         }
-
     }
-
 }
 
 pub enum ConnectionManager<IO, B>
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
-// IO: AsyncReadRent + AsyncWriteRent + Split
+where
+B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<Payload>,
+IO: AsyncReadRent + AsyncWriteRent + Split
 {
     Http1(Http1ConnManager<IO, B>),
     Http2(Http2ConnManager<B>),
 }
 
 pub enum PooledConnectionPipe<B>
-// where
-// Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
 {
     Http1(SingleSender<B>),
     Http2(MultiSender<B>)
 }
 
+impl<B> PooledConnectionPipe<B>
+{
+    pub async fn send_request(&mut self, req: Request<B>) -> Result<http::Response<B>, crate::Error> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        let res = match self {
+            Self::Http1(ref s) => {
+               s.req_tx.send(Transaction { req, resp_tx })
+            }
+            Self::Http2(ref s) => {
+               s.req_tx.send(Transaction { req, resp_tx })
+            }
+        };
+        
+        match res {
+            Ok(_) => {},
+            Err(e) => {
+                tracing::error!("Request send to conn manager failed {:?}", e);
+                return Err(crate::error::Error::ConnManagerReqSendError);
+            }
+        }
+
+        resp_rx.await?
+    }
+}
+
 impl<IO, B>  ConnectionManager<IO, B> 
 where
-Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
+B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<Payload>,
 IO: AsyncReadRent + AsyncWriteRent + Split
 {
 
-    async fn drive(&self) {
+    async fn drive(&mut self) {
         match  self {
-            ConnectionManager::Http1(ref conn) => {
+            ConnectionManager::Http1(ref mut conn) => {
                 conn.drive().await;
             }
             _ => { return; }
@@ -356,7 +423,7 @@ pub fn request_channel<B>() -> (SingleSender<B>, SingleRecvr<B>){
 
 pub struct PooledConnection<K, B>
 where
-    K: Hash + Eq + Debug,
+    K: Hash + Eq + Display,
 {
     // option is for take when drop
     key: Option<K>,
@@ -365,10 +432,43 @@ where
     reuseable: bool,
 }
 
-impl<K: Hash + Eq + 'static, B> ConnectionPool<K, B> {
+impl<K, B> PooledConnection<K, B>
+where
+    K: Hash + Eq+ Display,
+{
+    pub async fn send_request(&mut self, req: Request<B>) -> Result<http::Response<B>, crate::Error> {
+        match self.pipe.as_mut() {
+            Some(p) => {
+                match p.send_request(req).await {
+                    Ok(resp) => {
+                        let header_value = resp.headers().get(http::header::CONNECTION);
+                        self.reuseable = match header_value {
+                            Some(v) => !v.as_bytes().eq_ignore_ascii_case(CONN_CLOSE),
+                            None => resp.version() != http::Version::HTTP_10,
+                        };
+                        Ok(resp)
+                    },
+                    Err(e) => {
+                        // Something went wrong, mark this connection
+                        // as not reusable, and remove from the pool.
+                        tracing::error!("Request failed: {:?}", e);
+                        self.reuseable = false;
+                        Err(e)
+                    }
+                }
+            }
+            None => {
+                panic!()
+            }
+        }
+    }
+}
+
+impl<K: Hash + Eq + 'static, B : 'static> ConnectionPool<K, B> {
     #[cfg(feature = "time")]
-    fn new(idle_interval: Option<Duration>, max_idle: Option<usize>) -> Self {
-        let (tx, inner) = SharedInner::new(max_idle);
+    fn new(idle_interval: Option<Duration>, keepalive_conns: usize) -> Self {
+        // TODO: update upstream count to a relevant number instead of the magic number.
+        let (tx, inner) = SharedInner::new(keepalive_conns, 32);
         let conns = Rc::new(UnsafeCell::new(inner));
         let idle_interval = idle_interval.unwrap_or(DEFAULT_IDLE_INTERVAL);
         monoio::spawn(IdleTask {
@@ -382,56 +482,27 @@ impl<K: Hash + Eq + 'static, B> ConnectionPool<K, B> {
     }
 
     #[cfg(not(feature = "time"))]
-    fn new(max_idle: Option<usize>) -> Self {
-        let conns = Rc::new(UnsafeCell::new(SharedInner::new(max_idle)));
+    fn new(keepalive_conns: usize) -> Self {
+        let conns = Rc::new(UnsafeCell::new(SharedInner::new(keepalive_conns, 32)));
         Self { conns }
     }
 }
 
-impl<K: Hash + Eq + 'static, B> Default for ConnectionPool<K, B> {
+impl<K: Hash + Eq + 'static, B : 'static> Default for ConnectionPool<K, B> {
     #[cfg(feature = "time")]
     fn default() -> Self {
-        Self::new(None, None)
+        Self::new(None, DEFAULT_KEEPALIVE_CONNS)
     }
 
     #[cfg(not(feature = "time"))]
     fn default() -> Self {
-        Self::new(None)
+        Self::new(DEFAULT_KEEPALIVE_CONNS)
     }
 }
 
-// impl<K, IO> PooledConnection<K, IO>
-// where
-//     K: Hash + Eq + Display,
-// {
-//     pub fn set_reuseable(&mut self, reuseable: bool) {
-//         self.reuseable = reuseable;
-//     }
-// }
-
-// impl<K, IO> Deref for PooledConnection<K, IO>
-// where
-//     K: Hash + Eq + Display,
-// {
-//     type Target = ClientCodec<IO>;
-
-//     fn deref(&self) -> &Self::Target {
-//         self.codec.as_ref().expect("connection should be present")
-//     }
-// }
-
-// impl<K, IO> DerefMut for PooledConnection<K, IO>
-// where
-//     K: Hash + Eq + Display,
-// {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         self.codec.as_mut().expect("connection should be present")
-//     }
-// }
-
 impl<K, IO> Drop for PooledConnection<K, IO>
 where
-    K: Hash + Eq + Debug,
+    K: Hash + Eq + Display,
 {
     fn drop(&mut self) {
         if !self.reuseable {
@@ -450,22 +521,22 @@ where
 
             let conns = unsafe { &mut *pool.get() };
             #[cfg(feature = "logging")]
-            let key_debug = format!("{key:?}");
-
+            let key_str = key.to_string();
             let queue = conns
                 .mapping
                 .entry(key)
-                .or_insert(VecDeque::with_capacity(conns.max_idle));
+                .or_insert(VecDeque::with_capacity(conns.keepalive_conns));
 
             #[cfg(feature = "logging")]
             tracing::debug!(
-                "connection pool size: {:?} for key: {key_debug}",
+                "connection pool size: {:?} for key: {:?}",
                 queue.len(),
+                key_str
             );
 
-            if queue.len() > conns.max_idle {
+            if queue.len() > conns.keepalive_conns.into() {
                 #[cfg(feature = "logging")]
-                tracing::info!("connection pool is full for key: {key_debug}");
+                tracing::info!("connection pool is full for key: {:?}", key_str);
                 let _ = queue.pop_front();
             }
 
@@ -479,7 +550,7 @@ where
 
 impl<K, B> ConnectionPool<K, B>
 where
-    K: Hash + Eq + ToOwned<Owned = K> + Debug,
+    K: Hash + Eq + ToOwned<Owned = K> + Display,
 {
     pub fn get(&self, key: &K) -> Option<PooledConnection<K, B>> {
         let conns = unsafe { &mut *self.conns.get() };
@@ -487,7 +558,7 @@ where
         match conns.mapping.get_mut(key) {
             Some(v) => {
                 #[cfg(feature = "logging")]
-                tracing::debug!("connection got from pool for key: {key:?}");
+                tracing::debug!("connection got from pool for key: {:?} ", key.to_string());
                 v.pop_front().map(|idle| PooledConnection {
                     key: Some(key.to_owned()),
                     pipe: Some(idle.pipe),
@@ -497,7 +568,7 @@ where
             }
             None => {
                 #[cfg(feature = "logging")]
-                tracing::debug!("no connection in pool for key: {key:?}");
+                tracing::debug!("no connection in pool for key: {:?} ", key.to_string());
                 None
             }
         }

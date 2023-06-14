@@ -7,11 +7,11 @@ pub enum Error {
     #[error("http header error")]
     Http(#[from] http::Error),
     #[error("encode error {0}")]
-    Encode(#[from] monoio_http::h1::codec::encoder::EncodeError),
+    H1Encode(#[from] monoio_http::h1::codec::encoder::EncodeError),
     #[error("decode error {0}")]
-    Decode(#[from] monoio_http::h1::codec::decoder::DecodeError),
+    H1Decode(#[from] monoio_http::h1::codec::decoder::DecodeError),
     #[error("receive body error {0}")]
-    Payload(#[from] monoio_http::h1::payload::PayloadError),
+    H1Payload(#[from] monoio_http::h1::payload::PayloadError),
     #[error("io error {0}")]
     Io(#[from] std::io::Error),
     #[cfg(feature = "rustls")]
@@ -22,8 +22,13 @@ pub enum Error {
     NativeTls(#[from] monoio_native_tls::TlsError),
     #[error("serde_json error {0}")]
     Json(#[from] serde_json::Error),
-    #[error("H2 RecvStream decode error {0}")]
-    H2PayloadError(#[from] monoio_http::h2::Error),
+    #[error("H2 error {0}")]
+    H2Error(#[from] monoio_http::h2::Error),
+   #[error("Resp Recv from connection manager failed {0}")]
+    ConnManagerRespRecvError(#[from] local_sync::oneshot::error::RecvError),
+   #[error("Recv from conn manager failed")]
+    ConnManagerReqSendError,
+   #[error("Conn Manager marked this conn for close")]
+    ClosePooledConnection,
 }
-
 pub type Result<T> = std::result::Result<T, Error>;

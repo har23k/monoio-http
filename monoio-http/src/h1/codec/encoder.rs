@@ -270,7 +270,7 @@ where
                 StreamHint::Fixed => {
                     // get data(to set content length and body)
 
-                    let data = payload.data().await?;
+                    let data = payload.get_data().await?;
                     let data = data.unwrap();
                     // set special header
                     HeadEncoder::set_length_header(
@@ -305,7 +305,7 @@ where
                         .encode(head, &mut self.buf)
                         .map_err(Into::into)?;
 
-                    while let Ok(Some(data)) = payload.data().await {
+                    while let Ok(Some(data)) = payload.get_data().await {
                         write!(self.buf, "{:X}\r\n", data.bytes_init())
                             .expect("unable to format data length");
                         if self.buf.len() + data.bytes_init() > BACKPRESSURE_BOUNDARY {

@@ -1,4 +1,4 @@
-use std::{convert::Infallible, hash::Hash, net::ToSocketAddrs};
+use std::{convert::Infallible, hash::Hash, net::ToSocketAddrs, fmt::Display};
 
 use http::{uri::Authority, Uri};
 use service_async::{Param, ParamMut, ParamRef};
@@ -26,6 +26,12 @@ impl Clone for Key {
 }
 
 impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl std::fmt::Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.host, self.port)
     }

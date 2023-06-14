@@ -479,7 +479,7 @@ impl Body for RecvStream {
     where
         Self: 'a;
 
-    fn data(&mut self) -> Self::DataFuture<'_> {
+    fn get_data(&mut self) -> Self::DataFuture<'_> {
         async move { self.data().await.transpose() }
     }
 

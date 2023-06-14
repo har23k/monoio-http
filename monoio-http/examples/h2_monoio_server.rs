@@ -7,11 +7,19 @@ use monoio_http::h2::{
     server::{self, SendResponse},
     RecvStream,
 };
+use tracing_subscriber::FmtSubscriber;
 
 #[monoio::main]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:59288").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:9081").unwrap();
     println!("listening on {:?}", listener.local_addr());
+    let subscriber = FmtSubscriber::builder()
+    .with_max_level(tracing::Level::DEBUG) 
+        .finish();
+    // Initialize the tracing subscriber
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to set up the tracing subscriber");
+
 
     loop {
         if let Ok((socket, _peer_addr)) = listener.accept().await {
@@ -54,6 +62,7 @@ async fn handle_request(
         let _ = body.flow_control().release_capacity(data.len());
     }
 
+    println!("GOT request: {:?}", request);
     let response = http::Response::new(());
     let mut send = respond.send_response(response, false)?;
     println!(">>>> send");

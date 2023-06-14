@@ -41,7 +41,7 @@ impl<D: IoBuf, E> Body for Payload<D, E> {
     where
         Self: 'a;
 
-    fn data(&mut self) -> Self::DataFuture<'_> {
+    fn get_data(&mut self) -> Self::DataFuture<'_> {
         async move {
             match self {
                 Payload::None => {
