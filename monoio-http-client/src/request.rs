@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use http::{header::HeaderName, request::Builder, HeaderValue, Method, Uri};
-use monoio_http::h1::payload::{fixed_payload_pair, Payload};
+use monoio_http::{h1::payload::{fixed_payload_pair, Payload}, common::body::Body};
 
 #[cfg(any(feature = "rustls", feature = "native-tls"))]
 use crate::client::connector::DefaultTlsConnector;
@@ -10,13 +10,13 @@ use crate::{
 };
 
 #[cfg(any(feature = "rustls", feature = "native-tls"))]
-pub struct ClientRequest<C = DefaultTcpConnector<Key>, CS = DefaultTlsConnector<Key>> {
-    client: Client<C, CS>,
+pub struct ClientRequest<B: Body<Data = Bytes> + 'static , C = DefaultTcpConnector<Key, B>, CS = DefaultTlsConnector<Key, B>> {
+    client: Client<B, C, CS>,
     builder: Builder,
 }
 
 #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
-pub struct ClientRequest<C = DefaultTcpConnector<Key>> {
+pub struct ClientRequest<B, C = DefaultTcpConnector<Key>> {
     client: Client<C>,
     builder: Builder,
 }
@@ -24,19 +24,19 @@ pub struct ClientRequest<C = DefaultTcpConnector<Key>> {
 macro_rules! client_request_impl {
     ( $( $x:item )* ) => {
         #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
-        impl<C> ClientRequest<C> {
+        impl<B: Body<Data = Bytes> + 'static, C> ClientRequest<B, C> {
             $($x)*
         }
 
         #[cfg(any(feature = "rustls", feature = "native-tls"))]
-        impl<C, CS> ClientRequest<C, CS> {
+        impl<B: Body<Data = Bytes> + 'static, C, CS> ClientRequest<B, C, CS> {
             $($x)*
         }
     };
 }
 
 client_request_impl! {
-    pub fn new(client: Client<C, CS>) -> Self {
+    pub fn new(client: Client<B, C, CS> ) -> Self {
         Self {
             client,
             builder: Builder::new(),
@@ -85,7 +85,7 @@ client_request_impl! {
     }
 }
 
-impl ClientRequest {
+impl<B: Body<Data = Bytes> + 'static> ClientRequest<B> {
     pub async fn send(self) -> crate::Result<ClientResponse> {
         let request = Self::build_request(self.builder, Payload::None)?;
         let resp = self.client.send(request).await?;

@@ -31,6 +31,12 @@ impl std::fmt::Debug for Key {
     }
 }
 
+impl std::fmt::Display for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         self.host == other.host && self.port == other.port

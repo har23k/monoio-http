@@ -304,6 +304,37 @@ impl<D, E> StreamPayloadSender<D, E> {
     }
 }
 
+pub struct FramedPayloadRecvr {
+    pub data_rx: local_sync::mpsc::unbounded::Rx<Option<Result<Bytes, DecodeError>>>,
+    pub drop_tx: Option<local_sync::oneshot::Sender<()>>,
+    pub drop_rx: Option<local_sync::oneshot::Receiver<()>>,
+    pub hint: StreamHint,
+}
+
+impl Body for FramedPayloadRecvr
+{
+    type Data = Bytes;
+    type Error = DecodeError;
+    type DataFuture<'a> = impl std::future::Future<Output = Option<Result<Self::Data, Self::Error>>> + 'a
+    where
+        Self: 'a;
+
+    fn next_data(&mut self) -> Self::DataFuture<'_> {
+        async move {
+            while let Some(r) = self.data_rx.recv().await {
+               return r; 
+            }
+            // We are done with data, codec can now be reused
+            self.drop_tx.take().unwrap().send(());
+            None
+        }
+    }
+
+    fn stream_hint(&self) -> StreamHint {
+        self.hint
+    }
+}
+
 /// Payload with io and codec, mainly used by client.
 pub struct FramedPayload<T> {
     // The io provider.
@@ -324,6 +355,10 @@ impl<T> FramedPayload<T> {
             payload_decoder,
             eof: false,
         }
+    }
+
+    pub fn get_source(self) -> T {
+        self.io_source
     }
 }
 
