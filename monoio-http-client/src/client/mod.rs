@@ -7,14 +7,15 @@ use std::{rc::Rc, marker::PhantomData};
 use bytes::Bytes;
 use http::{uri::Scheme, HeaderMap};
 use monoio::io::{sink::SinkExt, stream::Stream, AsyncReadRent, AsyncWriteRent};
-use monoio_http::{h1::payload::{BoxedFramedPayload, FramedPayload, Payload, PayloadError}, common::{body::{Body, HttpBody}, response::Response}};
+use monoio_http::{h1::payload::{BoxedFramedPayload, FramedPayload, Payload, PayloadError, FramedPayloadRecvr}, common::{body::{Body, HttpBody}, response::Response, error::HttpError}, h2::RecvStream};
 
 use self::{
     connector::{Connector, DefaultTcpConnector, DefaultTlsConnector},
     key::{FromUriError, Key},
     pool::PooledConnection,
 };
-use crate::{request::ClientRequest, Error};
+// use crate::{request::ClientRequest, Error};
+use crate::Error;
 
 const CONN_CLOSE: &[u8] = b"close";
 // TODO: ClientBuilder
@@ -82,11 +83,11 @@ impl Builder {
         self
     }
 
-    fn build_http1<B: Body<Data = Bytes> + 'static>(self) -> Client<B> {
+    fn build_http1<B: Body<Data = Bytes, Error = HttpError> + From<RecvStream> + From<FramedPayloadRecvr>>(self) -> Client<B> {
         Client::new(self.global_config, self.connection_config)
     }
 
-    fn build_http2<B: Body<Data = Bytes> + 'static>(mut self) -> Client<B> {
+    fn build_http2<B: Body<Data = Bytes, Error = HttpError> + From<RecvStream> + From<FramedPayloadRecvr>>(mut self) -> Client<B> {
         self.http2_client();
         Client::new(self.global_config, self.connection_config)
     }
@@ -139,7 +140,7 @@ impl Default for Client<HttpBody> {
 
 impl <B> Client<B> 
 where
-B: Body<Data = Bytes, Error=PayloadError> + Body<Data = Bytes> + From<monoio_http::h2::RecvStream> + From<Payload>
+B: Body<Data = Bytes, Error = HttpError> + From<RecvStream> + From<FramedPayloadRecvr>
 {
     fn new(g_config: ClientGlobalConfig, c_config: ConnectionConfig) -> Self {
         let shared = Rc::new(ClientInner {
@@ -153,16 +154,15 @@ B: Body<Data = Bytes, Error=PayloadError> + Body<Data = Bytes> + From<monoio_htt
 
     pub async fn send_request(&self, req: http::Request<B>) -> crate::Result<Response<B>> {
         let key = req.uri().try_into().unwrap();
-        let mut conn = self.shared.http_connector.connect(key).await.unwrap();
-        #[cfg(any(feature = "rustls", feature = "native-tls"))]
-        let mut conn = self.shared.https_connector.connect(key).await.unwrap();
 
          match req.uri().scheme() {
             Some(s) if s == &Scheme::HTTP => {
+                let conn = self.shared.http_connector.connect(key).await.unwrap();
                 conn.send_request(req).await.into()
             }
             #[cfg(any(feature = "rustls", feature = "native-tls"))]
             Some(s) if s == &Scheme::HTTPS => {
+                let conn = self.shared.https_connector.connect(key).await.unwrap();
                 conn.send_request(req).await.into()
             }
             _ => panic!(),

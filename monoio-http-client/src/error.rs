@@ -30,6 +30,8 @@ pub enum Error {
     ConnManagerReqSendError,
    #[error("Conn Manager marked this conn for close")]
     ClosePooledConnection,
+   #[error("Http crate error {0}")]
+    HttpError(#[from] monoio_http::common::error::HttpError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

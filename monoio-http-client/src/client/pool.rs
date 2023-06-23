@@ -18,25 +18,27 @@ const MAX_KEEPALIVE_CONNS: usize = 16384;
 
 use bytes::Bytes;
 use local_sync::{oneshot, mpsc};
-use monoio::io::{sink::{Sink, SinkExt}, AsyncWriteRent, Split, AsyncReadRent, stream::Stream};
-use monoio_http::{h1::{codec::ClientCodec, BorrowFramedRead, FramedRead, payload::{PayloadError, Payload, FramedPayloadRecvr}}, common::{request::Request, response::Response, body::{Body, StreamHint, HttpBody}}, h2::SendStream};
+use monoio::{io::{sink::{Sink, SinkExt}, AsyncWriteRent, Split, AsyncReadRent, stream::Stream}, net::Pipe};
+use monoio_http::{h1::{codec::ClientCodec, BorrowFramedRead, FramedRead, payload::{PayloadError, Payload, FramedPayloadRecvr}}, common::{request::Request, response::Response, body::{Body, StreamHint, HttpBody}, error::HttpError}, h2::{SendStream, RecvStream}};
+
+use super::key::Key;
 
 type Conns<K, B> = Rc<UnsafeCell<SharedInner<K, B>>>;
 type WeakConns<K, B> = Weak<UnsafeCell<SharedInner<K, B>>>;
 
-struct IdleConnection<B> {
-    pipe: PooledConnectionPipe<B>,
+struct IdleConnection<K: Hash + Eq + Display, B> {
+    pipe: PooledConnectionPipe<K, B>,
     idle_at: Instant,
 }
 
-struct SharedInner<K, B> {
-    mapping: HashMap<K, VecDeque<IdleConnection<B>>>,
+struct SharedInner<K: Hash + Eq + Display, B> {
+    mapping: HashMap<K, VecDeque<IdleConnection<K, B>>>,
     max_idle: usize,
     #[cfg(feature = "time")]
     _drop: local_sync::oneshot::Receiver<()>,
 }
 
-impl<K, B> SharedInner<K, B> {
+impl<K: Hash + Eq + Display, B> SharedInner<K, B> {
     #[cfg(feature = "time")]
     fn new(max_idle: Option<usize>) -> (local_sync::oneshot::Sender<()>, Self) {
         let mapping = HashMap::with_capacity(DEFAULT_POOL_SIZE);
@@ -77,11 +79,11 @@ impl<K, B> SharedInner<K, B> {
 
 // TODO: Connection leak? Maybe remove expired connection periodically.
 #[derive(Debug)]
-pub struct ConnectionPool<K: Hash + Eq, B> {
+pub struct ConnectionPool<K: Hash + Eq + Display, B> {
     conns: Conns<K, B>,
 }
 
-impl<K: Hash + Eq, B> Clone for ConnectionPool<K, B> {
+impl<K: Hash + Eq + Display, B> Clone for ConnectionPool<K, B> {
     fn clone(&self) -> Self {
         Self {
             conns: self.conns.clone(),
@@ -89,7 +91,7 @@ impl<K: Hash + Eq, B> Clone for ConnectionPool<K, B> {
     }
 }
 
-impl<K: Hash + Eq + 'static, B: 'static> ConnectionPool<K, B> {
+impl<K: Hash + Eq + Display + 'static, B: 'static> ConnectionPool<K, B> {
     #[cfg(feature = "time")]
     fn new(idle_interval: Option<Duration>, max_idle: Option<usize>) -> Self {
         let (tx, inner) = SharedInner::new(max_idle);
@@ -112,7 +114,7 @@ impl<K: Hash + Eq + 'static, B: 'static> ConnectionPool<K, B> {
     }
 }
 
-impl<K: Hash + Eq + 'static, B: 'static> Default for ConnectionPool<K, B> {
+impl<K: Hash + Eq + Display + 'static, B: 'static> Default for ConnectionPool<K, B> {
     #[cfg(feature = "time")]
     fn default() -> Self {
         Self::new(None, None)
@@ -130,7 +132,7 @@ where
 {
     // option is for take when drop
     key: Option<K>,
-    pipe: Option<PooledConnectionPipe<B>>,
+    pipe: Option<PooledConnectionPipe<K, B>>,
     pool: WeakConns<K, B>,
     reuseable: bool,
 }
@@ -139,24 +141,18 @@ impl<K, B> PooledConnection<K, B>
 where
     K: Hash + Eq+ Display,
 {
-    pub async fn send_request(self, req: Request<B>) -> Result<http::Response<B>, crate::Error> {
-        match self.pipe.as_mut() {
-            Some(p) => {
-                match p.send_request(req).await {
-                    Ok(resp) => {
-                        let header_value = resp.headers().get(http::header::CONNECTION);
-                        self.reuseable = match header_value {
-                            Some(v) => !v.as_bytes().eq_ignore_ascii_case(CONN_CLOSE),
-                            None => resp.version() != http::Version::HTTP_10,
-                        };
+    pub async fn send_request(mut self, req: Request<B>) -> Result<http::Response<B>, crate::Error> {
 
-                        if let HttpBody::H1(ref mut payload_rcvr) = resp {
-                            let drop_rx = payload_rcvr.drop_rx.take().unwrap();
-                            monoio::spawn(async move {
-                                let connection = self;
-                                drop_rx.try_recv();
-                            });
-                        }
+        match self.pipe.take() {
+            Some(mut pipe) => {
+                self.pipe = Some(pipe.clone( ));
+                match pipe.send_request(req, self).await {
+                    Ok(resp) => {
+                        // let header_value = resp.headers().get(http::header::CONNECTION);
+                        // self.reuseable = match header_value {
+                        //     Some(v) => !v.as_bytes().eq_ignore_ascii_case(CONN_CLOSE),
+                        //     None => resp.version() != http::Version::HTTP_10,
+                        // };
                         Ok(resp)
                     },
                     Err(e) => {
@@ -164,7 +160,7 @@ where
                         // as not reusable, and remove from the pool.
                         #[cfg(feature = "logging")]
                         tracing::error!("Request failed: {:?}", e);
-                        self.reuseable = false;
+                        //self.reuseable = false;
                         Err(e)
                     }
                 }
@@ -328,7 +324,7 @@ where
         }
     }
 
-    pub fn link(&self, key: K, pipe: PooledConnectionPipe<B>) -> PooledConnection<K, B> {
+    pub fn link(&self, key: K, pipe: PooledConnectionPipe<K, B>) -> PooledConnection<K, B> {
         #[cfg(feature = "logging")]
         tracing::debug!("linked new connection to the pool");
         PooledConnection {
@@ -341,14 +337,14 @@ where
 }
 
 // TODO: make interval not eq to idle_dur
-struct IdleTask<K, B> {
+struct IdleTask<K: Hash + Eq + Display, B> {
     tx: local_sync::oneshot::Sender<()>,
     conns: WeakConns<K, B>,
     interval: monoio::time::Interval,
     idle_dur: Duration,
 }
 
-impl<K, B> Future for IdleTask<K, B> {
+impl<K: Hash + Eq + Display, B> Future for IdleTask<K, B> {
     type Output = ();
 
     fn poll(
@@ -381,41 +377,57 @@ impl<K, B> Future for IdleTask<K, B> {
     }
 }
 
-pub struct Transaction<B> {
+pub struct Transaction<K, B> 
+where
+    K: Hash + Eq + Display,
+{
     pub req: Request<B>,
-    pub resp_tx: oneshot::Sender<crate::Result<Response<B>>>
+    pub resp_tx: oneshot::Sender<crate::Result<Response<B>>>,
+    pub conn: PooledConnection<K, B>
 }
 
-impl<B> Transaction<B> 
+impl<K, B> Transaction<K, B> 
+where
+    K: Hash + Eq + Display,
 {
-    pub fn parts(self) -> (Request<B>, oneshot::Sender<crate::Result<Response<B>>>) {
-        (self.req, self.resp_tx)
+    pub fn parts(self) -> (Request<B>, oneshot::Sender<crate::Result<Response<B>>>, PooledConnection<K, B> ) {
+        (self.req, self.resp_tx, self.conn)
     } 
 
 }
-pub struct SingleRecvr<B> 
+pub struct SingleRecvr<K, B> 
+where
+    K: Hash + Eq + Display,
 {
-    pub req_rx: mpsc::unbounded::Rx<Transaction<B>>
+    pub req_rx: mpsc::unbounded::Rx<Transaction<K, B>>
 }
 
-pub struct SingleSender<B>
+pub struct SingleSender<K, B>
+where
+    K: Hash + Eq + Display,
 {
-    pub req_tx: mpsc::unbounded::Tx<Transaction<B>>
+    pub req_tx: mpsc::unbounded::Tx<Transaction<K, B>>
 }
 
-impl<B> SingleSender<B> 
+impl<K, B> SingleSender<K, B> 
+where
+    K: Hash + Eq + Display,
 {
-    pub fn into_multi_sender(self) -> MultiSender<B>{
+    pub fn into_multi_sender(self) -> MultiSender<K, B>{
         MultiSender { req_tx: self.req_tx }
     } 
 }
 
-pub struct MultiSender<B> 
+pub struct MultiSender<K, B> 
+where
+    K: Hash + Eq + Display,
 {
-    req_tx: mpsc::unbounded::Tx<Transaction<B>>
+    req_tx: mpsc::unbounded::Tx<Transaction<K, B>>
 }
 
-impl<B> Clone for MultiSender<B> 
+impl<K, B> Clone for MultiSender<K, B> 
+where
+    K: Hash + Eq + Display,
 {
     fn clone(&self) -> Self {
         Self {
@@ -423,18 +435,21 @@ impl<B> Clone for MultiSender<B>
         }
     }
 }
-pub struct Http1ConnManager<IO: AsyncWriteRent, B>
+pub struct Http1ConnManager<IO: AsyncWriteRent, K , B>
+where
+    K: Hash + Eq + Display,
 {
-    pub req_rx: SingleRecvr<B>,
+    pub req_rx: SingleRecvr<K, B>,
     pub handle: Option<ClientCodec<IO>>
 }
 
 const CONN_CLOSE: &[u8] = b"close";
 
-impl<IO, B> Http1ConnManager<IO, B> 
+impl<IO, K, B> Http1ConnManager<IO, K, B> 
 where
-B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<FramedPayloadRecvr>,
-IO: AsyncReadRent + AsyncWriteRent + Split
+IO: AsyncReadRent + AsyncWriteRent + Split,
+    K: Hash + Eq + Display,
+    B: Body<Data = Bytes, Error = HttpError> + From<monoio_http::h2::RecvStream> + From<FramedPayloadRecvr>,
 {
     pub async fn drive(&mut self) {
  
@@ -444,7 +459,7 @@ IO: AsyncReadRent + AsyncWriteRent + Split
 
             if let Some(t)= self.req_rx.req_rx.recv().await {
 
-                let (request, resp_tx) = t.parts();
+                let (request, resp_tx, connection) = t.parts();
                 let(parts, body) = request.into_parts();
 
                 #[cfg(feature = "logging")]
@@ -477,6 +492,9 @@ IO: AsyncReadRent + AsyncWriteRent + Split
                                 data_tx.send(Some(r));
                             }
 
+                            // At this point we have streamed the payload and the codec can be reused.
+                            // Drop the connection, which will add it back to the pool.
+                            drop(connection);
                             codec = framed_payload.get_source();
                         }
                         Some(Err(e)) => {
@@ -492,13 +510,13 @@ IO: AsyncReadRent + AsyncWriteRent + Split
                                 std::io::ErrorKind::UnexpectedEof,
                                 "unexpected eof when read response",
                             ))));
-                            break;                           // self.handle.set_reuseable(false);
+                            break;
                         }
                     },
                     Err(e) => {
                         #[cfg(feature = "logging")]
                         tracing::error!("send upstream request error {:?}", e);
-                        let _ =resp_tx.send(Err(crate::Error::H1Encode(e)));
+                        let _ =resp_tx.send(Err(e.into()));
                     }
                 }
             } else {
@@ -615,18 +633,19 @@ impl<B: Body<Data = Bytes>> StreamTask<B> {
 
 }
 
-pub struct Http2ConnManager<B: Body<Data = Bytes>> {
-    pub req_rx: SingleRecvr<B>,
+pub struct Http2ConnManager<K: Hash + Eq + Display, B: Body<Data = Bytes>> {
+    pub req_rx: SingleRecvr<K, B>,
     pub handle: monoio_http::h2::client::SendRequest<bytes::Bytes> 
 }
 
-impl<B> Http2ConnManager<B> 
+impl<K, B> Http2ConnManager<K, B> 
 where
-B: Body<Data = Bytes> + From<monoio_http::h2::RecvStream> + From<Payload> + 'static,
+    K: Hash + Eq + Display,
+    B: Body<Data = Bytes> + From<RecvStream> + From<FramedPayloadRecvr> + 'static,
 {
     pub async fn drive(&mut self)  {
             while let Some(t)= self.req_rx.req_rx.recv().await {
-                let (request, resp_tx) = t.parts();
+                let (request, resp_tx, connection) = t.parts();
                 let (parts, body) = request.into_parts();
                 #[cfg(feature = "logging")]
                 tracing::debug!("H2 conn manager recv request error {:?}", parts);
@@ -671,32 +690,34 @@ B: Body<Data = Bytes> + From<monoio_http::h2::RecvStream> + From<Payload> + 'sta
     }
 }
 
-pub enum ConnectionManager<IO, B>
+// pub enum ConnectionManager<IO, B>
+// where
+// B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<Payload>,
+// IO: AsyncReadRent + AsyncWriteRent + Split
+// {
+//     Http1(Http1ConnManager<IO, B>),
+//     Http2(Http2ConnManager<B>),
+// }
+
+pub enum PooledConnectionPipe<K, B>
 where
-B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<Payload>,
-IO: AsyncReadRent + AsyncWriteRent + Split
+    K: Hash + Eq + Display,
 {
-    Http1(Http1ConnManager<IO, B>),
-    Http2(Http2ConnManager<B>),
+    Http1(SingleSender<K, B>),
+    Http2(MultiSender<K, B>)
 }
 
-pub enum PooledConnectionPipe<B>
+impl<K: Hash + Eq + Display, B> PooledConnectionPipe<K, B>
 {
-    Http1(SingleSender<B>),
-    Http2(MultiSender<B>)
-}
-
-impl<B> PooledConnectionPipe<B>
-{
-    pub async fn send_request(&mut self, req: Request<B>) -> Result<http::Response<B>, crate::Error> {
+    pub async fn send_request(&mut self, req: Request<B>, conn: PooledConnection<K, B>) -> Result<http::Response<B>, crate::Error> {
         let (resp_tx, resp_rx) = oneshot::channel();
 
         let res = match self {
             Self::Http1(ref s) => {
-               s.req_tx.send(Transaction { req, resp_tx })
+               s.req_tx.send(Transaction { req, resp_tx, conn })
             }
             Self::Http2(ref s) => {
-               s.req_tx.send(Transaction { req, resp_tx })
+               s.req_tx.send(Transaction { req, resp_tx, conn })
             }
         };
         
@@ -713,23 +734,33 @@ impl<B> PooledConnectionPipe<B>
     }
 }
 
-impl<IO, B>  ConnectionManager<IO, B> 
-where
-B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<Payload>,
-IO: AsyncReadRent + AsyncWriteRent + Split
-{
-
-    async fn drive(&mut self) {
-        match  self {
-            ConnectionManager::Http1(ref mut conn) => {
-                conn.drive().await;
-            }
-            _ => { return; }
+impl<K: Hash + Eq + Display, B> Clone for PooledConnectionPipe<K, B> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Http1(tx) => {Self::Http1(SingleSender { req_tx: tx.req_tx.clone()})}
+            Self::Http2(tx) => {Self::Http2(tx.clone())},
         }
     }
+
 }
 
-pub fn request_channel<B>() -> (SingleSender<B>, SingleRecvr<B>){
+// impl<IO, B>  ConnectionManager<IO, B> 
+// where
+// B: Body<Data = Bytes, Error = PayloadError> + From<monoio_http::h2::RecvStream> + From<Payload>,
+// IO: AsyncReadRent + AsyncWriteRent + Split
+// {
+
+//     async fn drive(&mut self) {
+//         match  self {
+//             ConnectionManager::Http1(ref mut conn) => {
+//                 conn.drive().await;
+//             }
+//             _ => { return; }
+//         }
+//     }
+// }
+
+pub fn request_channel<K: Hash + Eq + Display, B>() -> (SingleSender<K, B>, SingleRecvr<K, B>){
     let (req_tx, req_rx) = mpsc::unbounded::channel();
     (SingleSender {req_tx}, SingleRecvr {req_rx})
 }

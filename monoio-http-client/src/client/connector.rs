@@ -5,7 +5,7 @@ use monoio::{
     io::{AsyncReadRent, AsyncWriteRent, Split},
     net::TcpStream,
 };
-use monoio_http::{h1::{codec::ClientCodec, payload::{PayloadError, Payload}}, common::body::Body};
+use monoio_http::{h1::{codec::ClientCodec, payload::{PayloadError, Payload, FramedPayloadRecvr}}, common::{body::Body, error::HttpError}, h2::RecvStream};
 
 use super::{pool::{ConnectionPool, PooledConnection, Http1ConnManager, PooledConnectionPipe, Http2ConnManager, request_channel}, Proto, ClientGlobalConfig, ConnectionConfig};
 
@@ -136,23 +136,24 @@ impl HttpConnector {
         Self { conn_config }
     }
 
-    pub async fn connect<IO, B>(&self, io: IO) -> Result<PooledConnectionPipe<B>, io::Error>
+    pub async fn connect<IO, K, B>(&self, io: IO) -> Result<PooledConnectionPipe<K, B>, io::Error>
     where
         IO: AsyncReadRent + AsyncWriteRent + 'static + Unpin + Split,
-        B: Body<Data = bytes::Bytes, Error = PayloadError>
+        K: Hash + Eq+ Display + 'static,
+        B: Body<Data = bytes::Bytes, Error = HttpError>
             + Body<Data = bytes::Bytes>
-            + From<monoio_http::h2::RecvStream>
-            + From<Payload>
+            + From<RecvStream>
+            + From<FramedPayloadRecvr>
             + 'static,
     {
-        let (sender, recvr) = request_channel::<B>();
+        let (sender, recvr) = request_channel::<K, B>();
 
         match self.conn_config.proto {
             Proto::Http1 => {
                 let handle = ClientCodec::new(io);
                 let mut conn = Http1ConnManager {
                     req_rx: recvr,
-                    handle,
+                    handle: Some(handle),
                 };
                 monoio::spawn(async move {
                     conn.drive().await;
@@ -186,7 +187,7 @@ impl HttpConnector {
 /// 2. combine connection with codec(of cause with buffer)
 pub struct PooledConnector<TC, K, IO, B>
 where
-    K: Hash + Eq,
+    K: Hash + Eq + Display,
     IO: AsyncReadRent + AsyncWriteRent + Split,
     B: Body<Data = Bytes>, // Request<B>: IntoParts<Body = Payload, Parts = RequestHead>,
 {
@@ -197,7 +198,7 @@ where
     _phantom: PhantomData<IO>,
 }
 
-impl<C, K: Hash + Eq, IO: AsyncReadRent + AsyncWriteRent + Split, B: Body<Data = Bytes>> Clone
+impl<C, K: Hash + Eq + Display, IO: AsyncReadRent + AsyncWriteRent + Split, B: Body<Data = Bytes>> Clone
     for PooledConnector<C, K, IO, B>
 where
     C: Clone,
@@ -215,7 +216,7 @@ where
 
 impl<
         TC: Default,
-        K: Hash + Eq + 'static,
+        K: Hash + Eq + Display + 'static,
         IO: AsyncReadRent + AsyncWriteRent + Split,
         B: Body<Data = Bytes> + 'static,
     > PooledConnector<TC, K, IO, B>
@@ -233,13 +234,13 @@ impl<
 
 impl<TC, K, IO, B> Connector<K> for PooledConnector<TC, K, IO, B>
 where
-    K: ToSocketAddrs + Hash + Eq + ToOwned<Owned = K> + Display,
+    K: ToSocketAddrs + Hash + Eq + ToOwned<Owned = K> + Display + 'static,
     TC: Connector<K, Connection = IO>,
     IO: AsyncReadRent + AsyncWriteRent + Split + 'static + Unpin,
-    B: Body<Data = Bytes, Error = PayloadError>
+    B: Body<Data = Bytes, Error = HttpError>
         + Body<Data = Bytes>
-        + From<monoio_http::h2::RecvStream>
-        + From<Payload>
+        + From<RecvStream>
+        + From<FramedPayloadRecvr>
         + 'static,
 {
     type Connection = PooledConnection<K, B>;

@@ -4,6 +4,7 @@ pub mod body;
 pub mod ext;
 pub mod request;
 pub mod response;
+pub mod error;
 
 pub trait FromParts<P, B = Bytes> {
     fn from_parts(parts: P, body: B) -> Self;

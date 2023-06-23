@@ -9,6 +9,8 @@ use monoio::{buf::IoBuf, macros::support::poll_fn, io::{AsyncReadRent, AsyncWrit
 
 use crate::{h1::{payload::{Payload, PayloadError, FramedPayload, FramedPayloadRecvr}, codec::{ClientCodec, decoder::DecodeError}}, h2::RecvStream};
 
+use super::error::HttpError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamHint {
     None,
@@ -81,7 +83,7 @@ impl Default for HttpBody {
 
 impl Body for HttpBody {
     type Data = Bytes;
-    type Error = DecodeError; 
+    type Error = HttpError; 
     type DataFuture<'a> = impl Future<Output = Option<Result<Self::Data, Self::Error>>> + 'a where
         Self: 'a;
 
@@ -89,9 +91,9 @@ impl Body for HttpBody {
         async move {
             match self {
                 Self::Ready( b) =>  { b.take().map(Result::Ok) }, 
-                Self::H1(ref mut p) => p.next_data().await,
+                Self::H1(ref mut p) => p.next_data().await.map(|r| r.map_err(|e| HttpError::from(e))),
                 Self::H2(ref mut p) => {
-                    p.next_data().await.map(|r| r.map_err(|_e| DecodeError::UnexpectedEof)) 
+                    p.next_data().await.map(|r| r.map_err(|e| HttpError::from(e))) 
                 }, // TODO: Unify H2 and H1 Errors
             }
         }
