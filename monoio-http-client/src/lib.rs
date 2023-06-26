@@ -6,7 +6,7 @@ mod error;
 mod request;
 mod response;
 
-pub use client::{connector::Connector, Client, ClientConfig};
+pub use client::{connector::Connector, Client, ClientConfig, Builder};
 pub use error::{Error, Result};
-// pub use request::ClientRequest;
+pub use request::ClientRequest;
 pub use response::ClientResponse;

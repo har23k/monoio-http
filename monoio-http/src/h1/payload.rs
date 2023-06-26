@@ -20,7 +20,7 @@ use super::{
     codec::decoder::{ChunkedBodyDecoder, DecodeError, FixedBodyDecoder, PayloadDecoder},
     BorrowFramedRead,
 };
-use crate::common::body::{Body, OwnedBody, StreamHint};
+use crate::common::body::{Body, StreamHint};
 
 #[derive(ThisError, Debug)]
 pub enum PayloadError {
@@ -432,21 +432,21 @@ where
     }
 }
 
-impl OwnedBody for BoxedFramedPayload {
-    type Data = Bytes;
-    type Error = DecodeError;
+// impl OwnedBody for BoxedFramedPayload {
+//     type Data = Bytes;
+//     type Error = DecodeError;
 
-    fn poll_next_data(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Self::Data, Self::Error>>> {
-        self.get_mut().stream.as_mut().poll_next(cx)
-    }
+//     fn poll_next_data(
+//         self: std::pin::Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//     ) -> std::task::Poll<Option<Result<Self::Data, Self::Error>>> {
+//         self.get_mut().stream.as_mut().poll_next(cx)
+//     }
 
-    fn stream_hint(&self) -> StreamHint {
-        self.hint
-    }
-}
+//     fn stream_hint(&self) -> StreamHint {
+//         self.hint
+//     }
+// }
 
 #[cfg(test)]
 mod tests {

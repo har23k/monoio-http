@@ -648,7 +648,7 @@ where
                 let (request, resp_tx, connection) = t.parts();
                 let (parts, body) = request.into_parts();
                 #[cfg(feature = "logging")]
-                tracing::debug!("H2 conn manager recv request error {:?}", parts);
+                tracing::debug!("H2 conn manager recv request {:?}", parts);
                 let request = http::request::Request::from_parts(parts, ());
 
                 let handle = self.handle.clone();
@@ -682,7 +682,8 @@ where
                            let _ = resp_tx.send(Ok(ret_resp));
                        },
                        Err(e) => {
-                         let _ = resp_tx.send(Err(e.into()));
+                           #[cfg(feature = "logging")]
+                           tracing::debug!("Response future returned error {:?}", e);                        let _ = resp_tx.send(Err(e.into()));
                        }
                     }
                 });
